@@ -2,14 +2,33 @@
 
 include::partial$console-access.adoc[]
 
-Instead of connecting OpenShift Lightspeed to each MCP server individually, you can route all MCP tool calls through a single, centrally managed gateway endpoint. The gateway aggregates every registered MCP server behind one URL, so platform teams can apply consistent authentication, authorization, and policy enforcement to every tool call. From the perspective of OpenShift Lightspeed, the gateway is just a single MCP server.
+So far, the intelligent assistant has talked to MCP servers one at a time: the built-in OpenShift MCP server from the cluster interaction module, and the custom Insights MCP server you registered yourself. That works fine for a couple of servers, but it does not scale. Every AI client has to know the address of every server, credentials have to be negotiated with each one, and there is no single place where the platform team can see or control what the LLM is actually allowed to do.
 
-This appendix deploys the full stack behind the gateway: Red Hat OpenShift AI, Connectivity Link with its MCP Gateway, the MCP Lifecycle operator, and the MCP server for Red Hat OpenShift. Most of the work happens in the *Bastion* tab. Two more appendix modules build on this one: xref:module-13.adoc[authentication, authorization, rate limiting, and tracing] at the gateway, and xref:module-14.adoc[guardrails] on top.
+This is the problem the **MCP Gateway** solves. Instead of connecting OpenShift Lightspeed to each MCP server individually, you route all MCP tool calls through a single, centrally managed gateway endpoint. The gateway aggregates every registered MCP server behind one URL, so from the perspective of OpenShift Lightspeed — or any other MCP client — the gateway is just a single MCP server. Behind that front door, the platform team can apply consistent controls to every tool call:
+
+* **Federation** — register as many MCP servers as you need behind one endpoint and one tool catalog; every server's tools are namespaced with a prefix so they never collide.
+* **Authentication** — validate *who* is calling on every tool call, using the cluster's own identity infrastructure.
+* **Authorization** — decide *which tools* each user or group may call, with ordinary Kubernetes RBAC.
+* **Rate limiting** — give every identity its own quota, so a runaway agent cannot starve the MCP servers.
+* **Tracing** — distributed traces of every tool call, from the client through the gateway to the server.
+* **Guardrails** — content inspection of every tool call and tool response, blocking PII leakage or prompt injection.
+
+The recommended full stack for MCP security and governance includes:
+
+* **Red Hat OpenShift AI** provides the MCP Lifecycle operator that manages MCPServer resources, the MCP catalog, and TrustyAI to enforce MCP guardrails.
+* **Connectivity Link** provides the Gateway API infrastructure and the Kuadrant policy engines.
+* The **MCP server for Red Hat OpenShift** provides the cluster tools, deployed as a managed MCPServer resource so the gateway can federate it.
+
+image::arch-module12.png[Architecture for this appendix: MCP Gateway stack, align="center", link=self, window=blank]
+
+Most of the work in this module happens in the *Bastion* tab. The moments where you check things in the web console are called out as they come up.
 
 [#install-rhoai]
 == 1. Install Red Hat OpenShift AI
 
-Red Hat OpenShift AI is not yet published in the `redhat-operators` catalog on OpenShift 5. Point the cluster at the RHDP snapshot of the 4.22 Red Hat Operators catalog instead.
+The first building block is Red Hat OpenShift AI. It covers the three pieces the gateway stack needs: the MCP Lifecycle operator that manages MCPServer resources, the MCP catalog you will deploy the MCP server from, and the TrustyAI component that provides the guardrails around your MCP servers.
+
+Red Hat OpenShift AI is not yet published in the `redhat-operators` catalog on OpenShift 5. Add a snapshot of the 4.22 Red Hat Operators catalog in your cluster instead:
 
 [source,bash,role="execute"]
 ----
@@ -42,7 +61,7 @@ oc wait catalogsource/redhat-operators-snapshot -n openshift-marketplace \
   --for=jsonpath='{.status.connectionState.lastObservedState}'=READY --timeout=300s
 ----
 
-The MCP Lifecycle operator is a Red Hat OpenShift AI component, so OpenShift AI must be installed next:
+Now install the operator itself:
 
 [source,bash,role="execute"]
 ----
@@ -84,7 +103,7 @@ done
 oc wait csv -n redhat-ods-operator -l operators.coreos.com/rhods-operator.redhat-ods-operator="" --for=jsonpath='{.status.phase}'=Succeeded --timeout=900s
 ----
 
-Create the `default-dsc` DataScienceCluster with only the components this appendix needs: the dashboard (which hosts the MCP catalog), the model registry (the MCP catalog stores its server metadata in the model registry database, and the dashboard hides the section unless the component is deployed), the MCP Lifecycle operator, and TrustyAI (used by the guardrails section). Every other component is explicitly removed to keep the footprint minimal:
+An OpenShift AI installation is shaped by its `DataScienceCluster` resource: each component can be turned on or off individually. Create the `default-dsc` with only the components this appendix needs — the dashboard (which hosts the MCP catalog), the model registry (the MCP catalog stores its server metadata in the model registry database), the MCP Lifecycle operator, and TrustyAI (used by the guardrails module). Every other component is explicitly removed to keep the footprint minimal:
 
 [source,bash,role="execute"]
 ----
@@ -140,7 +159,7 @@ Wait for the DataScienceCluster to become ready:
 oc wait --for=condition=Ready datasciencecluster/default-dsc --timeout=1200s
 ----
 
-Wait for the MCP Lifecycle operator to be running. The operator creates this deployment after the DataScienceCluster becomes ready:
+The MCP Lifecycle operator runs as a deployment inside the OpenShift AI applications namespace. Wait for it to be running — the operator creates this deployment after the DataScienceCluster becomes ready:
 
 [source,bash,role="execute"]
 ----
@@ -159,18 +178,24 @@ oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
   --type=merge -p '{"spec":{"dashboardConfig":{"mcpCatalog":true}}}'
 ----
 
-This adds the *AI hub* -> *MCP servers* section in OpenShift AI, where MCP servers can also be deployed and managed from the web console. Open the Red Hat OpenShift AI web console and verify the MCP servers dashboard appears. Log in with the same credentials you use for the OpenShift console:
+This adds the *AI hub* -> *MCP servers* section to the OpenShift AI dashboard — the place where MCP servers can be deployed and managed from the web console.
+
+Time to look at the console. Open the Red Hat OpenShift AI web console and verify the *AI hub* -> *MCP servers* section appears. Log in with the same credentials you use for the OpenShift console:
 
 * *Dashboard:* https://rh-ai.{openshift_cluster_ingress_domain}[window=blank]
 * *Username:* `{openshift_cluster_admin_username}`
 * *Password:* `{openshift_cluster_admin_password}`
 
-Refresh the browser if the section does not appear right away.
+TIP: Refresh the browser if the *MCP servers* section does not appear right away — the dashboard configuration takes a moment to propagate.
+
+You should land on a catalog of MCP servers, ready for deployment.
 
 [#deploy-mcp-server]
 == 2. Deploy the MCP server for Red Hat OpenShift
 
-Deploy the MCP server for Red Hat OpenShift as an `MCPServer` resource, with its configuration, service account, and RBAC. The service account is bound to the standard `edit` cluster role, which grants read and write access to cluster resources without allowing RBAC or namespace management: the write tools can create, update, and delete workloads.
+The gateway needs something to federate. This module deploys the MCP server for Red Hat OpenShift — the same server that powered cluster interaction in OpenShift Lightspeed — but this time as a managed MCPServer resource deployed from the MCP catalog, so the MCP Lifecycle operator takes care of running it.
+
+First, the supporting resources: the namespace, a service account, RBAC, and the server's configuration. The service account is bound to the standard `edit` cluster role, which grants read and write access to cluster resources: the write tools can create, update, and delete workloads. Finally, the ConfigMap states which MCP toolsets will be enabled. In this case, the same tools as the OpenShift Lightspeed built-in server, plus `netedge` and `ossm`:
 
 [source,bash,role="execute"]
 ----
@@ -215,17 +240,15 @@ data:
 EOF
 ----
 
-Now create the MCP server. In the OpenShift AI web console:
+Now deploy the server itself from the catalog. In the OpenShift AI web console:
 
 * Open *AI hub* > *MCP servers*
 * Open the Catalog tab
 * Open the *Red Hat OpenShift MCP server* entry
 * Click *Deploy MCP server*.
-* In the deployment dialog, enter `openshift-mcp-server`, then select project `mcp-servers`.
-* In the generated YAML, confirm that the ConfigMap name is openshift-mcp-server-config and under runtime.security.serviceAccountName set `serviceAccountName: openshift-mcp-server`.
-
-The YAML configuration should look like:
-
+* In the deployment dialog, enter `openshift-mcp-server` as the name, then select project `mcp-servers`.
+* In the generated YAML, confirm that the ConfigMap name is openshift-mcp-server-config and under runtime.security.serviceAccountName set `serviceAccountName: openshift-mcp-server`. The YAML configuration should look like:
++
 [source,yaml]
 ----
 runtime:
@@ -244,23 +267,24 @@ config:
         configMap:
           name: openshift-mcp-server-config
 ----
-
 * Then click *Deploy*.
-* Wait for the Status show _Avaiable_.
+* Wait for the Status of the deployment to show _Available_.
 
-Wait for the MCP server to be ready:
+Back in the bastion, wait for the MCP server to be ready:
 
 [source,bash,role="execute"]
 ----
 oc wait --for=condition=Ready mcpserver/openshift-mcp-server -n mcp-servers --timeout=600s
 ----
 
+The catalog records the deployment in the model registry, so the MCP servers dashboard shows the server's status, and the MCP Lifecycle operator manages its lifecycle — upgrades, configuration, and health — from now on.
+
 [#install-connectivity-link]
 == 3. Install Connectivity Link
 
-Connectivity Link provides the Gateway API infrastructure and the authentication components that the MCP Gateway builds on.
+Connectivity Link is Red Hat's application connectivity product, built on Kuadrant. It provides the Gateway API implementation that the MCP Gateway routes traffic through, and it ships the Kuadrant policy engines — the `AuthPolicy` and `RateLimitPolicy` resources to enforce authentication, authorization, and rate limits.
 
-Start by creating the GatewayClass:
+Start by creating the GatewayClass, which tells the cluster which controller implements Gateway API resources:
 
 [source,bash,role="execute"]
 ----
@@ -274,7 +298,7 @@ spec:
 EOF
 ----
 
-Then, install the Connectivity Link operator
+Then, install the Connectivity Link operator:
 
 [source,bash,role="execute"]
 ----
@@ -317,7 +341,7 @@ done
 oc wait csv -n kuadrant-system -l operators.coreos.com/rhcl-operator.kuadrant-system="" --for=jsonpath='{.status.phase}'=Succeeded --timeout=600s
 ----
 
-Then create the `Kuadrant` custom resource:
+The operator manages instances of the `Kuadrant` custom resource. Creating one is what actually installs the data plane and the policy engines:
 
 [source,bash,role="execute"]
 ----
@@ -341,7 +365,7 @@ oc wait kuadrant/kuadrant --for="condition=Ready=true" -n kuadrant-system --time
 [#deploy-mcp-gateway]
 == 4. Deploy the MCP Gateway
 
-With Connectivity Link 1.5, the `Kuadrant` custom resource deploys the MCP Gateway controller automatically: the `mcp-gateway-controller` pod runs in the `kuadrant-system` namespace, and the `mcp.kuadrant.io` custom resource definitions are already in place. Confirm that the controller is running:
+With Connectivity Link in place, the MCP Gateway is ready to be deployed. In Connectivity Link 1.5, the `Kuadrant` custom resource you just created deploys the MCP Gateway controller automatically: the `mcp-gateway-controller` pod runs in the `kuadrant-system` namespace. Confirm that the controller is running:
 
 [source,bash,role="execute"]
 ----
@@ -352,7 +376,12 @@ done
 oc wait --for=condition=Available deployment/mcp-gateway-controller -n kuadrant-system --timeout=300s
 ----
 
-Then create the `Gateway` and the `MCPGatewayExtension` that activates the gateway on it. The Gateway has two listeners: the `mcp` listener has the gateway's own hostname and serves the broker endpoint that clients talk to, and the `mcps` listener is a wildcard listener where every registered MCP server attaches with its own hostname:
+Now create the `Gateway` and the `MCPGatewayExtension` that activates the gateway on it. The design is worth understanding before you apply it:
+
+* The `mcp` listener has the gateway's own hostname and serves the *broker* — the endpoint that MCP clients like OpenShift Lightspeed talk to. The broker presents the combined tool catalog of every registered server and forwards each tool call to the right one.
+* The `mcps` listener is a wildcard listener where every registered MCP server attaches with its own hostname, keeping each server's traffic on its own route.
+
+The `MCPGatewayExtension` ties the two together on the `mcp` listener and manages the HTTPRoutes the gateway needs:
 
 [source,bash,role="execute"]
 ----
@@ -411,7 +440,7 @@ Wait for the extension to become ready:
 oc wait --for=condition=Ready mcpgatewayextension/mcp-gateway-extension -n mcp-system --timeout=300s
 ----
 
-Enable the Connectivity Link console plugin to visualize and manage the gateway from the web console:
+Connectivity Link also ships a console plugin that gives the gateway a face in the OpenShift web console. Enable it:
 
 [source,bash,role="execute"]
 ----
@@ -419,18 +448,24 @@ oc patch console.operator.openshift.io cluster --type json \
   -p '[{"op":"add","path":"/spec/plugins/-","value":"kuadrant-console-plugin"}]'
 ----
 
-The console reloads automatically. Log in again:
+The OpenShift web console reloads automatically. Log in again:
 
 * *Username:* `{openshift_cluster_admin_username}`
 * *Password:* `{openshift_cluster_admin_password}`
 
-A *Connectivity Link* section appears in the navigation menu. Its *MCP management* pages list the gateway extensions, the registered MCP servers with their online status, and the attached policies, and the *MCP Inspector* lets you validate and run individual tools directly.
+A *Connectivity Link* section appears in the navigation menu. Its *MCP management* pages list the gateway extensions, the registered MCP servers with their online status, and the attached policies. The *MCP Inspector* lets you validate and run individual tools directly — useful for testing a tool without going through the assistant.
 
+Take a moment to explore the *Connectivity Link* -> *MCP management* pages before moving on. Right now the lists are mostly empty; as you register servers in the next section and attach policies in the next modules, come back here to watch the gateway fill up.
 
 [#register-mcp-server]
 == 5. Register the MCP server
 
-Expose the MCP server to the gateway with an `HTTPRoute` labeled for discovery, then register it with an `MCPServerRegistration`. The route attaches to the wildcard `mcps` listener with a hostname of its own: the gateway routes the broker and every registered server by Host header, so each server needs a distinct hostname — otherwise tool calls forwarded to the server land on the broker's route instead:
+The MCP server is running, but the gateway does not know about it yet. Registration is a two-step dance:
+
+1. An `HTTPRoute` labeled for discovery exposes the server's Service on the gateway's wildcard `mcps` listener. Each server gets a hostname of its own, because the gateway routes the broker and every registered server by Host header. If a server shared the broker's hostname, its tool calls would land on the broker's route instead.
+2. An `MCPServerRegistration` tells the gateway's broker about the server: where to reach it, which prefix to put in front of its tool names (so tools from different servers never collide), a category, and a hint that helps LLM clients pick the right tool.
+
+Apply both:
 
 [source,bash,role="execute"]
 ----
@@ -480,7 +515,7 @@ spec:
 EOF
 ----
 
-Wait for the registration to discover the server's tools:
+The broker connects to the server and discovers its tools. Wait for the registration to report them:
 
 [source,bash,role="execute"]
 ----
@@ -488,17 +523,24 @@ oc wait --for=condition=Ready mcpsr/openshift-mcp-server -n mcp-servers --timeou
 oc get mcpsr -n mcp-servers
 ----
 
+The registration shows as *Ready*. In the web console, the *Connectivity Link* -> *MCP management* pages now list `openshift-mcp-server` with its online status and its catalog of `openshift_`-prefixed tools — the same tools the built-in server exposed in the cluster interaction module, now served through the gateway.
+
 [#configure-ols]
 == 6. Point OpenShift Lightspeed at the gateway
 
-Finally, reconfigure the `OLSConfig` to route MCP tool calls through the gateway. The gateway is reachable in-cluster at the listener hostname, exposes its Streamable HTTP endpoint at the `/mcp` path, and the `Authorization` header forwards the logged-in user's bearer token so the gateway can authorize each request. Setting `introspectionEnabled` to `false` also shuts down the operator-managed OpenShift MCP server that the cluster interaction module used, so its tools are not duplicated next to the ones federated through the gateway:
+The last step is to rewire OpenShift Lightspeed: instead of the built-in MCP server, the assistant should use the gateway's broker as its MCP server. Two details in this configuration do a lot of work:
+
+* The `Authorization` header is set with `valueFrom: kubernetes`, so OpenShift Lightspeed forwards the logged-in user's bearer token on every tool call.
+* `introspectionEnabled` is set to `false`, which shuts down the operator-managed OpenShift MCP server. Its tools would otherwise appear twice: once directly, once federated through the gateway with the `openshift_` prefix.
+
+Apply the change:
 
 [source,bash,role="execute"]
 ----
 oc patch olsconfig cluster --type merge -p '{"spec":{"featureGates":["MCPServer"],"ols":{"introspectionEnabled":false},"mcpServers":[{"name":"mcp-gateway","url":"http://mcp-gateway-openshift-default.mcp-system.svc.cluster.local:8080/mcp","timeout":30,"headers":[{"name":"Authorization","valueFrom":{"type":"kubernetes"}}]}]}}'
 ----
 
-The operator picks up the change, rolls out the OpenShift Lightspeed app server pod with the new configuration, and reports the overall status on the `OLSConfig` again. Wait for both before using the assistant:
+The operator picks up the change and rolls out the OpenShift Lightspeed app server pod with the new configuration. Wait for the Ready status before using the assistant:
 
 [source,bash,role="execute"]
 ----
@@ -506,11 +548,23 @@ oc rollout status deployment/lightspeed-app-server -n openshift-lightspeed --tim
 oc wait olsconfig cluster --for=jsonpath='{.status.overallStatus}'=Ready --timeout=600s
 ----
 
-Once the app server is running, the intelligent assistant discovers the tools of every MCP server registered behind the gateway, prefixed with the registration prefix. Ask a question that requires cluster introspection and the tool calls now route through the gateway:
+Once the app server is running, the intelligent assistant discovers the tools of every MCP server registered behind the gateway, prefixed with the registration prefix. Time to see the federation in action: switch to the *Console* tab, open the chat interface, click *Clear chat*, and ask a question that requires cluster introspection:
 
 [source,role="copypaste"]
 ----
 Show me the pods running in the lightspeed-demo namespace.
 ----
 
-The assistant calls the `openshift_pods_list` tool — the `openshift_` prefix marks it as a tool federated through the gateway rather than the operator-managed server.
+The assistant calls the `openshift_pods_list` tool — notice the `openshift_` prefix. Every tool call behind that answer traveled through the gateway's broker, which forwarded it to the registered MCP server.
+
+The same pattern scales to any MCP server you register later: deploy it, route it, register it, and its tools appear in the assistant's catalog with their own prefix — no OpenShift Lightspeed reconfiguration required beyond the single gateway entry.
+
+[#whats-next]
+== 7. What's next?
+
+The gateway now federates the MCP server's tools behind a single endpoint, and the assistant uses it. But take a closer look at what is actually enforced: the gateway accepts *any* request that reaches it. Nothing yet checks who is calling, which tools they may use, how fast they can call them, or what content flows through.
+
+That is the job of the next two modules:
+
+* xref:module-13.adoc[Gateway Authentication and Authorization] federates the cluster login to Keycloak to get distinct user personas, then requires a valid OpenShift token on every tool call, authorizes individual tools with Kubernetes RBAC, applies per-user rate limits, and wires up distributed tracing so you can watch every tool call end to end.
+* xref:module-14.adoc[Gateway Guardrails] adds content inspection of tool calls and responses with NeMo Guardrails, and finishes with an end-to-end test that puts every layer — federation, authentication, authorization, rate limiting, tracing, and guardrails — through its paces.

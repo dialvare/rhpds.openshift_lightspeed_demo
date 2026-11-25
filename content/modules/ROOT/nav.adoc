@@ -59,6 +59,7 @@
 ** xref:module-12.adoc#deploy-mcp-gateway[4. Deploy the MCP Gateway]
 ** xref:module-12.adoc#register-mcp-server[5. Register the MCP server]
 ** xref:module-12.adoc#configure-ols[6. Point OpenShift Lightspeed at the gateway]
+** xref:module-12.adoc#whats-next[7. What's next?]
 * xref:module-13.adoc[13. Appendix: Gateway Authentication and Authorization]
 ** xref:module-13.adoc#gateway-authentication[1. Require authentication at the gateway]
 *** xref:module-13.adoc#deploy-keycloak[Deploy Keycloak]
