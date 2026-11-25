@@ -1,0 +1,788 @@
+= Appendix: Gateway Authentication and Authorization
+
+include::partial$console-access.adoc[]
+
+This appendix builds on the gateway deployed in the previous appendix module and adds the controls a shared gateway needs: authentication of every tool call through a Kubernetes `TokenReview`, per-tool authorization through Kubernetes RBAC, per-user rate limits, and distributed tracing.
+
+[#gateway-authentication]
+== 1. Require authentication at the gateway
+
+By default, the gateway accepts any request that reaches it. To require authentication, attach an `AuthPolicy` that validates the bearer token of the logged-in OpenShift user — the very token OpenShift Lightspeed already forwards on every tool call. The gateway submits the token to a Kubernetes `TokenReview`, so every identity the cluster accepts is accepted by the gateway, and the caller's username and groups become available to the authorization policies in the next section.
+
+To have distinct personas to test with, this section first federates the cluster login to Keycloak, giving the lab two users: `user1`, a member of the `team-a` group, and `user2`, who belongs to no group. After the federation, both are regular OpenShift users, the console login goes through single sign-on, and the assistant's tool calls carry *their* tokens through the gateway. All the infrastructure is deployed from the *Bastion* tab; the testing happens in the *Console* tab.
+
+CAUTION: This section modifies the cluster `OAuth` configuration by appending Keycloak as an identity provider. The existing list of providers is preserved, so the admin credentials from the beginning of the lab keep working, and the change is reversible with a single `oc patch`. Running console sessions are not disturbed.
+
+[#deploy-keycloak]
+=== Deploy Keycloak
+
+Keycloak runs as a plain Deployment with an in-memory database, which is enough for the lab. Its realm is imported at startup from a realm file mounted from a ConfigMap. The realm defines the group `team-a` and the users `user1` (a member) and `user2` (no groups). The `openshift` client is what the cluster's OAuth server authenticates against when a user logs in through the console. The `openshift-groups` client scope carries the group-membership protocol mapper that puts the user's groups into the `groups` claim of the ID token — that is how `team-a` membership reaches OpenShift. Note that the mapper's provider ID is `oidc-group-membership-mapper`: older Keycloak releases called it `oidc-usermodel-group-membership-mapper`, and an import with the old ID silently creates a mapper that never fires, so the `groups` claim comes out empty. The `profile` and `email` client scopes must also be defined explicitly — a realm import that specifies `clientScopes` does not add Keycloak's built-in ones, and without them the OAuth server's request for the `email` and `profile` scopes is rejected with `invalid_scope` and the console login fails with *An authentication error occurred*. Each user also carries a fixed `id`, so the `sub` claim of the ID token stays stable across Keycloak restarts and the OpenShift identity mapping does not break. The client's redirect URI points at the cluster's OAuth callback, so the cluster ingress domain is captured first:
+
+[source,bash,role="execute"]
+----
+export INGRESS_DOMAIN=$(oc get ingresscontroller.operator default -n openshift-ingress-operator -o jsonpath='{.status.domain}')
+echo "INGRESS_DOMAIN=$INGRESS_DOMAIN"
+----
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: keycloak
+data:
+  mcp-realm.json: |
+    {
+      "realm": "mcp",
+      "enabled": true,
+      "sslRequired": "none",
+      "clientScopes": [
+        {
+          "name": "openshift-groups",
+          "description": "Emits the user's group memberships in the groups claim",
+          "protocol": "openid-connect",
+          "protocolMappers": [
+            {
+              "name": "groups",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-group-membership-mapper",
+              "config": {
+                "claim.name": "groups",
+                "full.path": "false",
+                "multivalued": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
+          "name": "profile",
+          "description": "The standard OpenID Connect profile scope",
+          "protocol": "openid-connect",
+          "protocolMappers": [
+            {
+              "name": "username",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-property-mapper",
+              "config": {
+                "user.attribute": "username",
+                "claim.name": "preferred_username",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "full name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-full-name-mapper",
+              "config": {
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "given name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-property-mapper",
+              "config": {
+                "user.attribute": "firstName",
+                "claim.name": "given_name",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "family name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-property-mapper",
+              "config": {
+                "user.attribute": "lastName",
+                "claim.name": "family_name",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
+          "name": "email",
+          "description": "The standard OpenID Connect email scope",
+          "protocol": "openid-connect",
+          "protocolMappers": [
+            {
+              "name": "email",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-property-mapper",
+              "config": {
+                "user.attribute": "email",
+                "claim.name": "email",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "email verified",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-hardcoded-claim-mapper",
+              "config": {
+                "claim.name": "email_verified",
+                "claim.value": "true",
+                "jsonType.label": "boolean",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        }
+      ],
+      "clients": [
+        {
+          "clientId": "openshift",
+          "name": "OpenShift",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "secret": "openshift-secret",
+          "standardFlowEnabled": true,
+          "redirectUris": ["https://oauth-openshift.${INGRESS_DOMAIN}/oauth2callback/keycloak-oidc"],
+          "defaultClientScopes": ["openshift-groups", "profile", "email"]
+        }
+      ],
+      "groups": [
+        {
+          "name": "team-a"
+        }
+      ],
+      "users": [
+        {
+          "id": "80976525-81f8-4a3e-a4f0-e1214fbede5a",
+          "username": "user1",
+          "enabled": true,
+          "email": "user1@example.com",
+          "firstName": "MCP",
+          "lastName": "User1",
+          "credentials": [{ "type": "password", "value": "user1pass", "temporary": false }],
+          "groups": ["team-a"]
+        },
+        {
+          "id": "14657bad-b0f5-4b15-a68c-f9b846aad5b1",
+          "username": "user2",
+          "enabled": true,
+          "email": "user2@example.com",
+          "firstName": "MCP",
+          "lastName": "User2",
+          "credentials": [{ "type": "password", "value": "user2pass", "temporary": false }]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.4
+          args: ["start-dev", "--import-realm"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: admin
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /realms/mcp
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import/mcp-realm.json
+              subPath: mcp-realm.json
+      volumes:
+        - name: realm-import
+          configMap:
+            name: keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  to:
+    kind: Service
+    name: keycloak
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+EOF
+----
+
+Wait for Keycloak to be ready:
+
+[source,bash,role="execute"]
+----
+oc rollout status deployment/keycloak -n keycloak --timeout=300s
+----
+
+You can sign in to the Keycloak admin console to inspect the imported `mcp` realm — its clients, protocol mappers, groups, and users:
+
+* *Console:* https://keycloak-keycloak.{openshift_cluster_ingress_domain}[window=blank]
+* *Username:* `admin`
+* *Password:* `admin`
+
+[#federate-login]
+=== Federate the console login
+
+Next, wire the cluster's OAuth server to Keycloak. Create the client secret and append the `OpenID` identity provider to the cluster's `OAuth` configuration. The JSON patch appends to the existing `identityProviders` list, so the provider used for the admin login stays in place. The `claims.groups` entry tells OpenShift to build group memberships from the `groups` claim of the ID token — the claim the Keycloak client's protocol mapper adds — and `extraScopes` asks Keycloak for the profile and email claims that fill in the username and display name. The lab cluster's ingress serves a publicly trusted certificate, so no custom CA needs to be configured:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-oidc-client
+  namespace: openshift-config
+stringData:
+  clientSecret: openshift-secret
+EOF
+export SSO_URL="https://$(oc get route keycloak -n keycloak -o jsonpath='{.spec.host}')"
+if oc get oauth cluster -o jsonpath='{.spec.identityProviders[*].name}' | grep -qw keycloak-oidc; then
+  echo "keycloak-oidc provider already present"
+else
+  oc patch oauth cluster --type json -p "[{\"op\":\"add\",\"path\":\"/spec/identityProviders/-\",\"value\":{\"name\":\"keycloak-oidc\",\"mappingMethod\":\"claim\",\"type\":\"OpenID\",\"openID\":{\"issuer\":\"${SSO_URL}/realms/mcp\",\"clientID\":\"openshift\",\"clientSecret\":{\"name\":\"keycloak-oidc-client\"},\"extraScopes\":[\"email\",\"profile\"],\"claims\":{\"preferredUsername\":[\"preferred_username\",\"sub\"],\"name\":[\"name\",\"preferred_username\"],\"email\":[\"email\"],\"groups\":[\"groups\"]}}}}]"
+fi
+----
+
+NOTE: If the login page does not show the *keycloak-oidc* button after the rollout, the OAuth server failed to load the provider and omitted it — check `oc logs deployment/oauth-openshift -n openshift-authentication`. On clusters whose ingress serves a self-signed certificate, the TLS check fails: export the served certificate chain (`openssl s_client -showcerts -connect <keycloak-route-host>:443 </dev/null 2>/dev/null | awk '/BEGIN CERT/,/END CERT/{print}'`), store it in a ConfigMap in `openshift-config` under the key `ca.crt`, and reference it from the provider with `ca: {name: <configmap>}`.
+
+NOTE: The realm file pins a fixed `id` for each user. Keycloak runs with an in-memory database, so a pod restart re-imports the realm and would otherwise assign *new* UUIDs — the `sub` claim in the ID token would change, the `keycloak-oidc` identity in OpenShift would no longer match, and logins would fail with *Could not create user*, because `mappingMethod: claim` refuses to remap an existing OpenShift user to a new identity. If that ever happens (for example after recreating the realm with different IDs), delete the stale objects and log in again: `oc delete user user1 && oc delete identity keycloak-oidc:<old-sub>`.
+
+Wait for the OAuth pods to roll out with the new provider:
+
+[source,bash,role="execute"]
+----
+oc rollout status deployment/oauth-openshift -n openshift-authentication --timeout=300s
+----
+
+Both users need read access to the cluster to browse the console and feed the assistant's query filters — the gateway policies of this and the next section decide what their tool calls may do, not their cluster role. The binding can be created before the users have ever logged in; RBAC does not require its subjects to exist yet:
+
+[source,bash,role="execute"]
+----
+oc adm policy add-cluster-role-to-user cluster-reader user1 user2
+----
+
+Test the federation in the console. Log out of the OpenShift console, and on the login page choose the new *keycloak-oidc* provider. Sign in as `user1` with password `user1pass`, and confirm the console loads with `user1` in the top right corner. `user2` logs in the same way with password `user2pass`. Back in the bastion, confirm that user1's login synced the `team-a` group into the cluster:
+
+[source,bash,role="execute"]
+----
+oc get group team-a
+----
+
+The group lists `user1` as its only member — `user2` logged in without any group.
+
+[#require-gateway-auth]
+=== Require a valid OpenShift token at the gateway
+
+Now attach the `AuthPolicy` to the `mcp` listener — the endpoint OpenShift Lightspeed talks to. The `kubernetesTokenReview` authenticator submits the request's bearer token to the Kubernetes API for review; tokens the cluster accepts pass, everything else is rejected with `401`:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: mcp-auth-policy
+  namespace: mcp-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+    sectionName: mcp
+  rules:
+    authentication:
+      openshift-users:
+        kubernetesTokenReview: {}
+EOF
+----
+
+The policy takes effect within seconds — gateway policies are hot-reloaded, nothing restarts. OpenShift Lightspeed already sends the logged-in user's token on every MCP request, so the assistant needs no reconfiguration: ask it anything as the admin, then log in as `user1` and `user2` and ask again. The assistant works for all three, because authentication only checks that the caller is a valid cluster user — deciding *what* each user may call is the job of the next section.
+
+Requests without a token are rejected. Verify from the bastion — the port-forward is reused by the tests in the rest of this module. The bastion sits outside the cluster's DNS, so a local port is forwarded to the gateway's Service instead: the tunnel is transparent, and the gateway still routes by the `Host` header, so every request below keeps the hostname it needs:
+
+[source,bash,role="execute"]
+----
+oc port-forward -n mcp-system svc/mcp-gateway-openshift-default 18080:8080 >/dev/null 2>&1 &
+export GW="http://localhost:18080"
+sleep 2
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+  -H 'Content-Type: application/json' \
+  ${GW}/mcp -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}'
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $(oc whoami -t)" \
+  -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+  -H 'Content-Type: application/json' \
+  ${GW}/mcp -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}'
+----
+
+The first response is `401` — no token. The second is `200`: the bastion's own admin token is a valid OpenShift token, and the TokenReview accepted it.
+
+NOTE: The port-forward runs in the background of the terminal session and is reused by the tests in the rest of this module. If a request to `$GW` ever returns no HTTP code at all, the tunnel has dropped — re-run the `oc port-forward` command.
+
+[#tool-authorization]
+== 2. Authorize tool calls with Kubernetes RBAC
+
+Authentication checks who is calling; authorization decides what they may do. This section delegates that decision to the cluster's RBAC — the same mechanism that already governs every other permission on the cluster. When the broker forwards a tool call to a registered MCP server, it adds `x-mcp-toolname` and `x-mcp-servername` headers and forwards the caller's token. An `AuthPolicy` on the internal `mcps` listener turns those headers into a `SubjectAccessReview` — the API behind `oc auth can-i` — asking: *can this user use the tool `pods_list` on the server `openshift-mcp-server`?* The grants are ordinary `ClusterRole` and `ClusterRoleBinding` objects, so platform teams manage MCP tool access exactly like access to any other cluster resource, and the enforcement stays invisible to the MCP servers.
+
+First, the grants. The `mcp-tools-observer` role grants the `use` verb on the resource `openshift-mcp-server` — the MCP server name becomes the RBAC resource — but only for the resource names listed, which are the tool names. It is bound to the `team-a` group, so `user1` inherits it through the group synced from Keycloak. The admin role omits `resourceNames` entirely, which grants every tool on the server, and is bound to `system:cluster-admins`, so the lab admin keeps full tool access:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-tools-observer
+rules:
+  - apiGroups: ["mcp.kuadrant.io"]
+    resources: ["openshift-mcp-server"]
+    verbs: ["use"]
+    resourceNames: ["pods_list", "pods_list_in_namespace", "pods_get", "events_list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-tools-observer-team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-tools-observer
+subjects:
+  - kind: Group
+    name: team-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-tools-admin
+rules:
+  - apiGroups: ["mcp.kuadrant.io"]
+    resources: ["openshift-mcp-server"]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-tools-admin-cluster-admins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-tools-admin
+subjects:
+  - kind: Group
+    name: system:cluster-admins
+EOF
+----
+
+NOTE: `resourceNames` does not support wildcards, so the tool list is explicit — extend it to grant more tools. The `mcp.kuadrant.io` API group and the `use` verb are just strings that the policy and the RBAC agree on; no such API needs to exist in the cluster.
+
+Then the policy. It is attached to the `mcps` listener and gated on the presence of the `x-mcp-toolname` header, so only actual tool calls are checked — tool listings, the broker's health checks, and other requests pass through untouched. The `kubernetesTokenReview` identifies the caller, and the `kubernetesSubjectAccessReview` builds the RBAC check from the broker's headers:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: mcp-tool-auth-policy
+  namespace: mcp-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+    sectionName: mcps
+  defaults:
+    when:
+      - predicate: "request.headers.exists(h, h == 'x-mcp-toolname')"
+    rules:
+      authentication:
+        openshift-users:
+          kubernetesTokenReview: {}
+      authorization:
+        tool-access-check:
+          kubernetesSubjectAccessReview:
+            user:
+              selector: auth.identity.user.username
+            authorizationGroups:
+              selector: auth.identity.user.groups
+            resourceAttributes:
+              group:
+                value: mcp.kuadrant.io
+              resource:
+                expression: request.headers['x-mcp-servername']
+              name:
+                expression: request.headers['x-mcp-toolname']
+              verb:
+                value: use
+EOF
+----
+
+The `authorizationGroups` field matters: a `SubjectAccessReview` does not look up the caller's group memberships on its own, so the groups resolved by the TokenReview — including `team-a` — are passed along explicitly. Without it, only bindings to the user by name would match, and the group binding would never fire.
+
+Now test from the console. Clear chat and ask:
+
+[source,role="copypaste"]
+----
+What pods are running in the lightspeed-demo namespace?
+----
+
+* As `user1`, member of `team-a`: the assistant calls one of the `openshift_pods_list` tools, the SubjectAccessReview matches the `mcp-tools-observer` grant through the group binding, and the tool returns the pod list.
+* As `user2`: the tool call is rejected with `403` before it reaches the server — the assistant reports the failure as an opaque `unhandled errors in a TaskGroup` message, which is this rejection, not a broken deployment. Note that `user2` can still browse to *Workloads* → *Pods* in the console and see the pods directly, thanks to `cluster-reader` from the previous section — the gateway governs the assistant's tool calls, not the user's console session.
+* As the admin: the call works — `system:cluster-admins` carries the unrestricted role.
+
+The Kubernetes API never saw any of this authorization traffic as the user: with `cluster_auth_mode = "kubeconfig"` set in the previous module, the MCP server contacts the cluster as its own service account, so gateway authorization and the server's cluster identity are independent layers — and both did their job.
+
+To finish, remove the policy — the RBAC objects can stay, they are inert without it — give the gateway a few seconds to drop it, and confirm the assistant works again as `user2`:
+
+[source,bash,role="execute"]
+----
+oc delete authpolicy mcp-tool-auth-policy -n mcp-system
+----
+
+[source,role="copypaste"]
+----
+What pods are running in the lightspeed-demo namespace?
+----
+
+[#rate-limit-tool-calls]
+== 3. Rate-limit tool calls
+
+To protect the gateway from excessive traffic, attach a `RateLimitPolicy` to the broker's HTTP route — `mcp-gateway-route`, the route the `MCPGatewayExtension` created automatically when the gateway was deployed. This example allows 30 requests per minute, counted per identity with the username the authentication policy resolves, so each user gets their own quota:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1
+kind: RateLimitPolicy
+metadata:
+  name: mcp-gateway-ratelimit
+  namespace: mcp-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: mcp-gateway-route
+  limits:
+    per-user:
+      rates:
+        - limit: 30
+          window: 1m
+      counters:
+        - expression: auth.identity.user.username
+EOF
+----
+
+NOTE: If `mcp-gateway-route` does not exist, list the routes in `mcp-system` with `oc get httproutes -n mcp-system` and target the one attached to the `mcp` listener — the route the `MCPGatewayExtension` created.
+
+Requests beyond the limit receive HTTP 429. The console cannot practically generate 30 requests, so exhaust the quota from the bastion with the admin token — the same kind of OpenShift token the assistant sends — through the port-forward from step 1:
+
+[source,bash,role="execute"]
+----
+for i in $(seq 1 35); do
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "Authorization: Bearer $(oc whoami -t)" \
+    -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+    -H 'Content-Type: application/json' \
+    ${GW}/mcp \
+    -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}')
+  echo "Request ${i}: HTTP ${CODE}"
+  sleep 0.7
+done
+----
+
+The first requests return `200`; once the quota is exhausted they return `429`. While the admin is rate-limited, ask the assistant the same question as `user1` in the console — `user1` has a quota of their own, and the assistant answers normally. That isolation is the per-identity counter at work. Inspect the rate limit headers on a rejected request:
+
+[source,bash,role="execute"]
+----
+curl -svk -o /dev/null \
+  -H "Authorization: Bearer $(oc whoami -t)" \
+  -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+  -H 'Content-Type: application/json' \
+  ${GW}/mcp \
+  -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}' 2>&1 | grep -iE '< HTTP|< x-ratelimit'
+----
+
+The `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-reset` headers report the quota and when the window resets.
+
+Gateway policies are hot-reloaded: changes take effect within seconds, without restarting anything. Drop the limit to 5 requests per minute:
+
+[source,bash,role="execute"]
+----
+oc get ratelimitpolicy mcp-gateway-ratelimit -n mcp-system -o json \
+  | jq '.spec.limits["per-user"].rates[0].limit = 5' \
+  | oc replace -f -
+sleep 15
+for i in $(seq 1 10); do
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "Authorization: Bearer $(oc whoami -t)" \
+    -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+    -H 'Content-Type: application/json' \
+    ${GW}/mcp \
+    -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}')
+  echo "Request ${i}: HTTP ${CODE}"
+  sleep 0.7
+done
+----
+
+Requests are now rejected after the fifth call. Restore the original limit before moving on:
+
+[source,bash,role="execute"]
+----
+oc get ratelimitpolicy mcp-gateway-ratelimit -n mcp-system -o json \
+  | jq '.spec.limits["per-user"].rates[0].limit = 30' \
+  | oc replace -f -
+----
+
+[#tracing]
+== 4. Enable distributed tracing
+
+Both the MCP Gateway and OpenShift Lightspeed can emit OpenTelemetry traces. This section deploys a Jaeger instance that receives traces from both, so a single UI shows what happens to a request as it travels from the intelligent assistant through the gateway to the MCP server.
+
+The Jaeger OTLP receiver accepts two protocols with different transport security, matching the needs of its two producers. The gRPC port serves TLS with a certificate issued by the cluster's service CA — the OpenShift Lightspeed collector always exports over TLS and trusts that CA — while the HTTP port serves plain HTTP in the cluster, which is what the gateway sends. The `service.beta.openshift.io/serving-cert-secret-name` annotation on the Service asks the service CA to issue and rotate the certificate automatically:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-config
+  namespace: mcp-system
+data:
+  config.yaml: |
+    service:
+      extensions: [jaeger_storage, jaeger_query]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter]
+    extensions:
+      jaeger_query:
+        storage:
+          traces: memory
+      jaeger_storage:
+        backends:
+          memory:
+            memory:
+              max_traces: 50000
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            tls:
+              cert_file: /etc/tls/tls.crt
+              key_file: /etc/tls/tls.key
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch:
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: memory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: mcp-system
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: quay.io/jaegertracing/jaeger:2.20.0
+          args: ["--config", "/etc/jaeger/config.yaml"]
+          ports:
+            - containerPort: 16686
+              name: ui
+            - containerPort: 4317
+              name: otlp-grpc
+            - containerPort: 4318
+              name: otlp-http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 16686
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jaeger
+            - name: tls
+              mountPath: /etc/tls
+      volumes:
+        - name: config
+          configMap:
+            name: jaeger-config
+        - name: tls
+          secret:
+            secretName: jaeger-otlp-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: mcp-system
+  labels:
+    app: jaeger
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: jaeger-otlp-tls
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: otlp-grpc
+      port: 4317
+    - name: otlp-http
+      port: 4318
+    - name: ui
+      port: 16686
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: jaeger
+  namespace: mcp-system
+spec:
+  to:
+    kind: Service
+    name: jaeger
+  port:
+    targetPort: ui
+  tls:
+    termination: edge
+EOF
+----
+
+Wait for Jaeger to be ready:
+
+[source,bash,role="execute"]
+----
+oc rollout status deployment/jaeger -n mcp-system --timeout=300s
+----
+
+Then point the gateway at it. The `Kuadrant` custom resource created when Connectivity Link was installed controls the policy engines' observability: patching it with a tracing endpoint sends the Envoy data plane's traces to Jaeger. The MCP broker — the component that routes tool calls — is a separate Deployment created by the `MCPGatewayExtension`, and picks up the standard OpenTelemetry environment variables:
+
+[source,bash,role="execute"]
+----
+oc patch kuadrant kuadrant -n kuadrant-system --type merge \
+  -p '{"spec":{"observability":{"enable":true,"tracing":{"defaultEndpoint":"http://jaeger.mcp-system.svc:4318","insecure":true}}}}'
+oc set env deployment/mcp-gateway -n mcp-system \
+  OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger.mcp-system.svc:4318" \
+  OTEL_EXPORTER_OTLP_INSECURE="true"
+----
+
+NOTE: The broker Deployment is named after the Gateway. If `oc set env` reports that the deployment does not exist, list the deployments in `mcp-system` with `oc get deployments -n mcp-system` and patch the one the `MCPGatewayExtension` created.
+
+Finally, enable trace export for OpenShift Lightspeed. The operator runs an OpenTelemetry collector next to the app server; setting `spec.audit.tracingEndpoint` on the `OLSConfig` makes that collector forward the traces it receives to Jaeger, over the TLS-secured gRPC port:
+
+[source,bash,role="execute"]
+----
+oc patch olsconfig cluster --type merge \
+  -p '{"spec":{"audit":{"tracingEndpoint":"jaeger.mcp-system.svc:4317"}}}'
+oc rollout status deployment/lightspeed-otel-collector -n openshift-lightspeed --timeout=300s
+----
+
+To see it all working, generate some traffic: ask the intelligent assistant any question in the console, and make a gateway request from the bastion through the port-forward from step 1, carrying the admin token so the authentication policy lets it through:
+
+[source,bash,role="execute"]
+----
+curl -sk -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $(oc whoami -t)" \
+  -H 'Host: mcp-gateway-openshift-default.mcp-system.svc.cluster.local' \
+  -H 'Content-Type: application/json' \
+  ${GW}/mcp \
+  -d '{"jsonrpc":"2.0","id":0,"method":"tools/list"}'
+----
+
+Then open the Jaeger UI:
+
+[source,bash,role="execute"]
+----
+oc get route jaeger -n mcp-system -o jsonpath='{.spec.host}{"\n"}'
+----
+
+Browse to that host in a new browser tab. In the *Search* tab, select the `mcp-gateway` service to find the gateway traces — tool calls show up under the `mcp-router.tool-call` operation, with spans carrying MCP-specific tags such as `mcp.method.name` and `mcp.server`. Select the `lightspeed-app-server` service to find the trace of the chatbot conversation, including the tool calls it made through the gateway.
